@@ -9,6 +9,7 @@ from hunter.detection import authority, fingerprint
 from hunter.discovery import discover, resolve_details
 from hunter.models import CVES, endpoints, passive_decisive, triage_assessment, utc_now, version_assessment
 from hunter.network import Network, Stopped, gather_workers
+from hunter.site_identity import equivalent_pages
 from hunter.tls import inspect_tls
 
 
@@ -57,6 +58,41 @@ def merge_diagnostic_version(item, patch):
                                       "strength": "strong", "url": entry["url"]})
 
 
+def wildcard_page_match(item, baseline):
+    """A random wildcard hostname serving the same page is not a site."""
+    if (not baseline or not isinstance(item.get("http_status"), int) or
+            item["http_status"] != baseline.get("http_status")):
+        return False
+    if any(item.get(field) != baseline.get(field)
+           for field in ("php", "version", "server", "technologies")):
+        return False
+    digest = item.get("content_sha256")
+    if digest and digest == baseline.get("content_sha256"):
+        return True
+    neutral_digest = item.get("host_neutral_sha256")
+    if neutral_digest and neutral_digest == baseline.get("host_neutral_sha256"):
+        return True
+    if item["http_status"] == 200:
+        return equivalent_pages(item, baseline)
+    first, second = item.get("site_identity") or {}, baseline.get("site_identity") or {}
+    a, b = set(first.get("sketch") or ()), set(second.get("sketch") or ())
+    return bool(first.get("title") and len(first["title"]) >= 8 and
+                first["title"] == second.get("title") and
+                min(first.get("captured_chars", 0), second.get("captured_chars", 0)) >= 512 and
+                min(len(a), len(b)) >= 20 and len(a & b) / len(a | b) >= 0.85)
+
+
+async def tcp_port_reachable(address, port, timeout):
+    """Check a wildcard IP once before repeating doomed HTTP connections."""
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=timeout)
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except (OSError, TimeoutError):
+        return False
+
+
 async def run_scan(options, control, emit, transport=None):
     network = Network(options, control, transport)
     emit({"type": "started", "id": str(uuid.uuid4()), "started_at": utc_now(), "options": options.to_dict()})
@@ -64,6 +100,7 @@ async def run_scan(options, control, emit, transport=None):
     active_probed = {}
     active_lock = asyncio.Lock()  # Never stress two services concurrently.
     coverage = {"dns_unresolved": 0, "http_errors": 0, "tls_errors": 0, "wildcard_candidates": 0,
+                "wildcard_http_matches": 0, "wildcard_tcp_skipped": 0,
                 "crawl_partial": 0, "sources": []}
 
     def discovery_event(event):
@@ -79,6 +116,31 @@ async def run_scan(options, control, emit, transport=None):
                     emit({"type": "asset", "asset": pending_asset(url, target)})
         emit({"type": "stage", "stage": "DNS / certificate discovery", "total": 0, "completed": 0})
         hosts = await discover(options, network, control, discovery_event)
+        wildcard_baselines = {}
+        for root, probe in sorted({(host["wildcard_root"], host["wildcard_probe"])
+                                   for host in hosts if host.get("wildcard_probe")}):
+            for scheme in ("https", "http"):
+                await control.checkpoint()
+                try:
+                    response = await network.request("GET", f"{scheme}://{probe}/")
+                    wildcard_baselines[(root, scheme)] = fingerprint(response, (root,))
+                except Exception as exc:
+                    emit({"type": "log", "message":
+                          f"Wildcard HTTP baseline for {root} ({scheme}): {type(exc).__name__}."})
+        wildcard_ports = set()
+        for host in hosts:
+            if host.get("wildcard"):
+                for url in endpoints(host["target"], options):
+                    parsed = urlsplit(url)
+                    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                    wildcard_ports.update((address, port) for address in host["ips"])
+        wildcard_tcp = {}
+        for address, port in sorted(wildcard_ports):
+            await control.checkpoint()
+            wildcard_tcp[(address, port)] = await tcp_port_reachable(address, port, options.timeout)
+            if not wildcard_tcp[(address, port)]:
+                emit({"type": "log", "message":
+                      f"Wildcard DNS address {address}:{port}: TCP unavailable; matching candidates are not HTTP sites."})
         queue, unique = asyncio.Queue(), set()
         for host in hosts:
             await control.checkpoint()
@@ -95,6 +157,9 @@ async def run_scan(options, control, emit, transport=None):
                 for address in addresses:
                     item = pending_asset(url, target, host["ips"], host["source"], address)
                     item["dns"], item["wildcard_ambiguous"] = host["dns"], host.get("wildcard", False)
+                    item["scope_roots"] = sorted(host.get("scope_roots", ()))
+                    if host.get("wildcard_root"):
+                        item["wildcard_root"] = host["wildcard_root"]
                     if item["id"] in unique:
                         continue
                     unique.add(item["id"])
@@ -102,13 +167,31 @@ async def run_scan(options, control, emit, transport=None):
                         item.update(php="NOT_ESTABLISHED", assessment="DNS_UNRESOLVED",
                                     error="DNS unresolved; inspect DNS status. Candidate retained, HTTP not attempted.")
                     else:
-                        queue.put_nowait(item)
+                        parsed = urlsplit(url)
+                        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                        if (host.get("wildcard") and
+                                all(wildcard_tcp.get((address, port)) is False for address in host["ips"])):
+                            item.update(php="NOT_ESTABLISHED", assessment="WILDCARD_PORT_UNREACHABLE",
+                                        error=f"Wildcard DNS address has no reachable TCP service on port {port}.")
+                            coverage["wildcard_tcp_skipped"] += 1
+                        else:
+                            queue.put_nowait(item)
                     emit({"type": "asset", "asset": item.copy()})
         total = queue.qsize()
         emit({"type": "stage", "stage": "HTTP / PHP detection", "total": total, "completed": 0})
 
         async def inspect_response(item, response, check=True):
             item.update(fingerprint(response, (target.host for target in options.targets)))
+            if (item.get("wildcard_root") and
+                    wildcard_page_match(item, wildcard_baselines.get(
+                        (item.get("wildcard_root"), urlsplit(item["url"]).scheme)))):
+                item["wildcard_http_match"] = True
+                item["php"] = "NOT_ESTABLISHED"
+                item["assessment"] = "WILDCARD_RESPONSE"
+                item["verdict"] = "Unconfirmed"
+                item["verdict_reason"] = "This hostname serves the same page as a random wildcard DNS name."
+                coverage["wildcard_http_matches"] += 1
+                return item
             if (options.active_check or options.collect_patch_evidence) and check:
                 if item["connect_ip"]:
                     # Read patch evidence from this exact backend, never from a random DNS result.

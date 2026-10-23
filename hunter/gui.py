@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 from html import escape
 from importlib.resources import files
 import json
@@ -6,9 +7,9 @@ from pathlib import Path
 import re
 import sqlite3
 import sys
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
-from PySide6.QtCore import QEasingCurve, QPoint, QStandardPaths, Qt, QThread, QVariantAnimation, Signal
+from PySide6.QtCore import QEasingCurve, QPoint, QStandardPaths, Qt, QThread, QTimer, QVariantAnimation, Signal
 from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
@@ -19,8 +20,13 @@ from PySide6.QtWidgets import (
 )
 
 from hunter.engine import Control, pending_asset, run_scan
-from hunter.models import ScanOptions, Target, WEB_PORTS, endpoints, parse_targets
-from hunter.storage import Store, export_report
+from hunter.models import ScanOptions, Target, WEB_PORTS, endpoints, parse_targets, triage_assessment
+from hunter.site_identity import equivalent_pages
+from hunter.storage import Store, export_visible_results
+from hunter.widgets import CopyToast, StyledCheckBox
+
+
+DISPLAY_ADDRESS_ROLE = Qt.ItemDataRole.UserRole.value + 1
 
 
 STYLE = """
@@ -39,9 +45,17 @@ QPushButton:hover { background: #dce9f9; }
 QPushButton:disabled { color: #a2adba; background: #f0f3f6; border-color: #e4e9ee; }
 QPushButton#primary { background: #e62d4d; color: #ffffff; font-weight: 700; border: none; }
 QPushButton#primary:hover { background: #cf2443; }
+QPushButton#primary:disabled { background: #f8cbd4; color: #833547; border: 1px solid #efabb9; }
+QPushButton#pauseButton { background: #eaf1fb; color: #314761; }
+QPushButton#pauseButton:checked { background: #fff0cc; color: #785618; border: 1px solid #e6c671; }
+QPushButton#pauseButton:disabled { background: #f0f3f6; color: #a2adba; border: 1px solid #e4e9ee; }
+QPushButton#stopButton { background: #fbe9e6; color: #a33c35; border: 1px solid #eec7c2; }
+QPushButton#stopButton:hover { background: #f7d9d4; }
+QPushButton#stopButton:disabled { background: #f0f3f6; color: #a2adba; border: 1px solid #e4e9ee; }
 QPushButton#drawerButton { background: #f1f5fb; border-color: #dce5ef; }
 QCheckBox { spacing: 7px; font-weight: 550; }
 QCheckBox::indicator { width: 16px; height: 16px; }
+QWidget#optionRow { background: transparent; }
 QTableWidget { background: #ffffff; alternate-background-color: #f8fbff; border: 1px solid #e1e8f0; gridline-color: #edf1f5; selection-background-color: #e4efff; selection-color: #24384c; }
 QHeaderView::section { background: #eef4fb; color: #526477; padding: 8px; border: none; font-weight: 650; }
 QProgressBar { background: #e7edf5; border: none; border-radius: 3px; min-height: 6px; max-height: 6px; text-align: center; }
@@ -89,32 +103,89 @@ def help_html(description, impact):
 
 
 def result_group_key(asset):
-    """Merge pages on the same destination site when their assessments agree."""
-    final_url = asset.get("final_url")
-    if final_url and asset.get("http_status") == 200:
-        parsed = urlsplit(final_url)
+    """A reached destination/backend is one site, regardless of page path."""
+    if isinstance(asset.get("http_status"), int) and asset["http_status"] > 0:
+        parsed = urlsplit(asset.get("final_url") or asset.get("site_url") or asset["url"])
         if parsed.hostname:
             return ("destination", parsed.scheme, parsed.hostname.lower(),
                     parsed.port or (443 if parsed.scheme == "https" else 80),
-                    asset.get("php"), asset.get("version"),
-                    tuple(asset.get("reported_versions") or ()), asset.get("assessment"),
-                    asset.get("verdict"), tuple(asset.get("proxy") or ()),
-                    asset.get("wildcard_ambiguous"), asset.get("detection_partial"),
                     asset.get("connect_ip"))
-    digest = asset.get("content_sha256")
-    if not digest or asset.get("detection_partial") or asset.get("http_status") != 200:
-        return ("endpoint", asset.get("id", asset["url"]))
-    parsed = urlsplit(asset.get("final_url") or asset.get("site_url") or asset["url"])
-    host = (parsed.hostname or "").lower()
-    if not host:
-        return ("endpoint", asset.get("id", asset["url"]))
-    return ("content", parsed.scheme, host.removeprefix("www."),
-            parsed.port or (443 if parsed.scheme == "https" else 80), parsed.path or "/", parsed.query,
-            digest, asset.get("php"), asset.get("version"),
-            tuple(asset.get("reported_versions") or ()), asset.get("assessment"),
-            asset.get("verdict"), asset.get("http_status"),
-            tuple(asset.get("proxy") or ()), asset.get("wildcard_ambiguous"),
-            asset.get("connect_ip"))
+    return ("endpoint", asset.get("id", asset["url"]))
+
+
+def outside_scan_scope(asset):
+    """Recognize foreign redirects, including sessions saved before the flag existed."""
+    if asset.get("external_redirect"):
+        return True
+    original = urlsplit(asset.get("url") or "").hostname
+    final = urlsplit(asset.get("final_url") or "").hostname
+    site = urlsplit(asset.get("site_url") or "").hostname
+    return bool(original and final and site == original and final != original)
+
+
+EMPTY_CONTENT_SHA256 = hashlib.sha256(b"").hexdigest()
+
+
+def empty_site_response(asset):
+    """An empty HTTP 200 body alone does not establish a website."""
+    return (asset.get("http_status") == 200 and
+            asset.get("content_sha256") == EMPTY_CONTENT_SHA256 and
+            asset.get("php") == "NOT_ESTABLISHED" and
+            asset.get("verdict") != "Vulnerable")
+
+
+def weak_error_response(asset):
+    """An HTTP error with only weak PHP hints does not prove a live site."""
+    status = asset.get("http_status")
+    return (isinstance(status, int) and status >= 400 and status not in (401, 403) and
+            asset.get("php") != "DETECTED" and asset.get("verdict") != "Vulnerable")
+
+
+def site_summary(assets, members, representative):
+    """Summarize page evidence without silently choosing a conflicting verdict."""
+    shown = dict(representative)
+    pages = [assets[key] for key in members]
+    versions = {version for page in pages for version in
+                ([page.get("version")] + list(page.get("reported_versions") or [])) if version}
+    verdicts = {page.get("verdict", "Unconfirmed") for page in pages}
+    active = {page.get("active", {}).get("status") for page in pages}
+    contradiction = (len(versions) > 1 or
+                     ("Fixed version" in verdicts and bool(verdicts & {"At risk", "Vulnerable"})) or
+                     ("UNPATCHED_SESSION_PATH" in active and "PATCHED_SESSION_PATH" in active))
+    if contradiction:
+        shown["version"] = None if len(versions) > 1 else shown.get("version")
+        shown["verdict"] = "Unconfirmed"
+        shown["verdict_reason"] = ("Different pages of this site gave conflicting PHP version or patch signals. "
+                                   "Inspect the checked pages and the running PHP workers.")
+        shown["site_conflict"] = True
+    elif "Vulnerable" in verdicts:
+        shown["verdict"] = "Vulnerable"
+    elif "At risk" in verdicts:
+        shown["verdict"] = "At risk"
+    elif "Fixed version" in verdicts:
+        shown["verdict"] = "Fixed version"
+    else:
+        shown["verdict"] = "Unconfirmed"
+    if len(versions) == 1:
+        shown["version"] = next(iter(versions))
+    if not contradiction:
+        source = next((page for page in pages if page.get("verdict") == shown["verdict"]), None)
+        if source:
+            shown["verdict_reason"] = source.get("verdict_reason", "")
+            shown["assessment"] = source.get("assessment")
+    shown["evidence"] = []
+    seen_evidence = set()
+    for page in pages:
+        for entry in page.get("evidence") or []:
+            marker = json.dumps(entry, sort_keys=True, default=str)
+            if marker not in seen_evidence:
+                seen_evidence.add(marker)
+                shown["evidence"].append(entry)
+    if any(page.get("php") == "DETECTED" for page in pages):
+        shown["php"] = "DETECTED"
+    elif any(page.get("php") == "LIKELY" for page in pages):
+        shown["php"] = "LIKELY"
+    return shown
 
 
 def result_preference(asset):
@@ -123,20 +194,26 @@ def result_preference(asset):
     parsed = urlsplit(display)
     original = urlsplit(asset["url"])
     final = urlsplit(asset.get("final_url") or asset["url"])
-    return (original.scheme != final.scheme, parsed.scheme != "https",
+    return (asset.get("http_status") != 200,
+            original.hostname != final.hostname,
+            original.scheme != final.scheme, parsed.scheme != "https",
+            original.path not in ("", "/"),
             (parsed.hostname or "").startswith("www."),
             asset["url"] != display, display)
 
 
 def result_address(asset):
-    """Show the HTTPS destination of an upgrade, even without a direct HTTPS input."""
+    """Show a website origin; keep exact checked paths in its details."""
     original = urlsplit(asset["url"])
     final = urlsplit(asset.get("final_url") or "")
-    if (asset.get("http_status") == 200 and original.scheme == "http" and
+    if (not outside_scan_scope(asset) and asset.get("http_status") == 200 and original.scheme == "http" and
             final.scheme == "https" and final.hostname):
         site_url = asset.get("site_url")
-        return site_url if site_url and urlsplit(site_url).scheme == "https" else asset["final_url"]
-    return asset.get("site_url") or asset["url"]
+        address = site_url if site_url and urlsplit(site_url).scheme == "https" else asset["final_url"]
+    else:
+        address = asset.get("site_url") or asset["url"]
+    parsed = urlsplit(address)
+    return urlunsplit((parsed.scheme, parsed.netloc, "/", "", "")) if parsed.hostname else address
 
 
 def preferred_active_asset(assets, members, representative):
@@ -161,90 +238,174 @@ def protocol_pair_key(asset):
             original_port != (443 if original.scheme == "https" else 80) or
             final_port != (443 if final.scheme == "https" else 80)):
         return None
-    return (original.hostname.removeprefix("www."), original.path or "/", original.query,
+    return (original.hostname.removeprefix("www."),
             asset.get("php"), asset.get("version"), asset.get("assessment"),
             asset.get("verdict"), asset.get("detection_partial"),
             tuple(asset.get("proxy") or ()), asset.get("wildcard_ambiguous"), asset.get("connect_ip"))
 
 
-def site_identity_keys(asset):
-    """Match a reached site across redirects and equivalent protocol or www views."""
-    final = urlsplit(asset.get("final_url") or result_address(asset))
-    if not final.hostname:
-        return set()
-    host = final.hostname.lower()
-    port = final.port or (443 if final.scheme == "https" else 80)
-    backend = asset.get("connect_ip")
-    keys = {("destination", final.scheme, host, port, backend)}
-    if asset.get("http_status") == 200 and port == (443 if final.scheme == "https" else 80):
-        keys.add(("protocol", host, backend))
-        digest = asset.get("content_sha256")
-        if digest and not asset.get("detection_partial"):
-            keys.add(("content", final.scheme, host.removeprefix("www."), port,
-                      digest, backend))
-    return keys
+def same_site_views(first, second):
+    """Join direct default-port variants only with evidence of one website."""
+    a = urlsplit(first.get("final_url") or first["url"])
+    b = urlsplit(second.get("final_url") or second["url"])
+    first_status, second_status = first.get("http_status"), second.get("http_status")
+    if (first_status not in (200, 401, 403) or second_status not in (200, 401, 403) or
+            first.get("connect_ip") != second.get("connect_ip") or
+            not a.hostname or not b.hostname or a.scheme not in ("http", "https") or
+            b.scheme not in ("http", "https") or
+            a.port not in (None, 80 if a.scheme == "http" else 443) or
+            b.port not in (None, 80 if b.scheme == "http" else 443) or
+            a.hostname.removeprefix("www.") != b.hostname.removeprefix("www.")):
+        return False
+    if first_status != 200 or second_status != 200:
+        digest = first.get("content_sha256")
+        return bool(first_status == second_status and digest and digest != EMPTY_CONTENT_SHA256 and
+                    digest == second.get("content_sha256"))
+    if (first.get("content_sha256") and
+            first["content_sha256"] == second.get("content_sha256") and
+            min((first.get("site_identity") or {}).get("captured_chars", 0),
+                (second.get("site_identity") or {}).get("captured_chars", 0)) >= 4):
+        return True
+    if equivalent_pages(first, second):
+        return True
+    if first.get("site_identity") and second.get("site_identity"):
+        return False
+    # Saved scans from earlier versions have no page sketch. Preserve their
+    # HTTP/HTTPS pairing when their passive conclusions agree.
+    return (a.hostname == b.hostname and a.scheme != b.scheme and
+            first.get("php") == second.get("php") and
+            first.get("version") == second.get("version") and
+            first.get("assessment") == second.get("assessment") and
+            first.get("verdict") == second.get("verdict"))
+
+
+def variant_preference(group_key, asset):
+    """A direct HTTP address leads when both protocols serve the same site."""
+    _, scheme, host, _, _ = group_key
+    title = (asset.get("site_identity") or {}).get("title", "")
+    return (host != title, scheme != "http", host.startswith("www."), host)
 
 
 def result_layout(assets, expanded_pairs, php_only=True):
-    """Return site rows, folding redirects and equivalent HTTP/HTTPS views."""
+    """One site per row; dropdowns show direct protocol and www variants."""
     groups = {}
-    php_site_keys = set()
-    if not php_only:
-        for asset in assets.values():
-            if asset.get("php") in ("DETECTED", "LIKELY"):
-                php_site_keys.update(site_identity_keys(asset))
     for key, asset in assets.items():
-        found_php = asset.get("php") in ("DETECTED", "LIKELY")
-        if (found_php if php_only else
-                not found_php and isinstance(asset.get("http_status"), int) and asset["http_status"] > 0
-                and not site_identity_keys(asset).intersection(php_site_keys)):
+        if (not outside_scan_scope(asset) and not asset.get("wildcard_http_match") and
+                not empty_site_response(asset) and not weak_error_response(asset) and
+                isinstance(asset.get("http_status"), int)
+                and asset["http_status"] > 0):
             groups.setdefault(result_group_key(asset), []).append(key)
+    for members in groups.values():
+        members.sort(key=lambda member: result_preference(assets[member]))
+    keys = list(groups)
+    parent = {key: key for key in keys}
 
-    # Preserve apex/www folding when their final URLs differ but content is identical.
-    identical = {}
-    for group_key, members in list(groups.items()):
-        asset = assets[min(members, key=lambda key: result_preference(assets[key]))]
+    def find(key):
+        while parent[key] != key:
+            parent[key] = parent[parent[key]]
+            key = parent[key]
+        return key
+
+    def join(first, second):
+        parent[find(second)] = find(first)
+
+    for index, first_key in enumerate(keys):
+        first = assets[groups[first_key][0]]
+        for second_key in keys[index + 1:]:
+            second = assets[groups[second_key][0]]
+            if same_site_views(first, second):
+                join(first_key, second_key)
+
+    # Fold old aliases only within one input scope and when the titled host
+    # itself was reached. Shared templates across unrelated domains stay apart.
+    titled_pages = {}
+    for key in keys:
+        asset = assets[groups[key][0]]
+        identity = asset.get("site_identity") or {}
+        title = identity.get("title", "")
         digest = asset.get("content_sha256")
-        if not digest or asset.get("detection_partial") or asset.get("http_status") != 200:
-            continue
-        final = urlsplit(asset.get("final_url") or result_address(asset))
-        alias_key = (final.scheme, (final.hostname or "").removeprefix("www."),
-                     final.port or (443 if final.scheme == "https" else 80),
-                     final.path or "/", final.query, digest, asset.get("php"), asset.get("version"),
-                     tuple(asset.get("reported_versions") or ()), asset.get("assessment"),
-                     asset.get("verdict"), tuple(asset.get("proxy") or ()),
-                     asset.get("wildcard_ambiguous"), asset.get("connect_ip"))
-        if alias_key in identical:
-            groups[identical[alias_key]].extend(members)
-            del groups[group_key]
-        else:
-            identical[alias_key] = group_key
+        if (asset.get("http_status") == 200 and digest and
+                identity.get("captured_chars", 0) >= 512 and
+                re.fullmatch(r"[a-z0-9][a-z0-9.-]*\.[a-z]{2,}", title)):
+            for scope_root in asset.get("scope_roots") or ():
+                marker = (scope_root, title, digest, key[4])
+                titled_pages.setdefault(marker, []).append(key)
+    for (_, title, _, _), matches in titled_pages.items():
+        if any(key[2] == title for key in matches):
+            for key in matches[1:]:
+                join(matches[0], key)
 
-    representatives = {key: min(members, key=lambda member: result_preference(assets[member]))
-                       for key, members in groups.items()}
-    candidates = {}
-    for group_key, representative in representatives.items():
-        asset = assets[representative]
-        pair_key = protocol_pair_key(asset)
-        if pair_key is not None:
-            candidates.setdefault(pair_key, {}).setdefault(urlsplit(asset["url"]).scheme, []).append(group_key)
-    children = {}
-    for pair_key, schemes in candidates.items():
-        if len(schemes.get("http", [])) == 1 and len(schemes.get("https", [])) == 1:
-            children[schemes["http"][0]] = (schemes["https"][0], ("protocol_pair", pair_key))
-    child_keys = {child for child, _ in children.values()}
-    order = {key: index for index, key in enumerate(groups)}
-    roots = [key for key in groups if key not in child_keys]
-    roots.sort(key=lambda key: min(order[key], order[children[key][0]]) if key in children else order[key])
+    # An error page is not another website when a healthy protocol/www
+    # variant of the same hostname was reached. Keep it in site details.
+    for key in keys:
+        asset = assets[groups[key][0]]
+        status = asset.get("http_status", 0)
+        if not 500 <= status <= 599:
+            continue
+        for sibling in keys:
+            healthy = assets[groups[sibling][0]]
+            if (healthy.get("http_status") == 200 and
+                    key[2].removeprefix("www.") == sibling[2].removeprefix("www.") and
+                    key[4] == sibling[4]):
+                join(sibling, key)
+                break
+    for index, key in enumerate(keys):
+        asset = assets[groups[key][0]]
+        if not 500 <= asset.get("http_status", 0) <= 599:
+            continue
+        for sibling in keys[index + 1:]:
+            other = assets[groups[sibling][0]]
+            if (500 <= other.get("http_status", 0) <= 599 and
+                    key[2] == sibling[2] and key[4] == sibling[4]):
+                join(key, sibling)
+
+    clusters = {}
+    for key in keys:
+        clusters.setdefault(find(key), []).append(key)
     rows = []
-    for key in roots:
-        pair = children.get(key)
-        search_members = groups[key] + groups[pair[0]] if pair else groups[key]
-        rows.append((key, groups[key], pair[1] if pair else None, False, search_members))
-        if pair and pair[1] in expanded_pairs:
-            child_key = pair[0]
-            rows.append((child_key, groups[child_key], None, True, groups[child_key]))
-    return rows, len(roots)
+    count = 0
+    for family in sorted(clusters.values(), key=lambda family: min(keys.index(key) for key in family)):
+        reachable = [key for key in family if assets[groups[key][0]].get("http_status") in (200, 401, 403)]
+        if not reachable and any(assets[member].get("php") in ("DETECTED", "LIKELY")
+                               for key in family for member in groups[key]):
+            reachable = family[:1]
+        if not reachable:
+            continue
+        has_php = any(assets[member].get("php") in ("DETECTED", "LIKELY")
+                      for key in family for member in groups[key])
+        if has_php != php_only:
+            continue
+        if not php_only and any(
+                other_key not in family and
+                other_key[2] == key[2] and other_key[4] == key[4] and
+                any(assets[member].get("php") in ("DETECTED", "LIKELY")
+                    for member in groups[other_key])
+                for key in family for other_key in keys):
+            continue
+        visible = sorted(reachable, key=lambda key: variant_preference(key, assets[groups[key][0]]))
+        combined = [member for key in visible for member in groups[key]]
+        combined.extend(member for key in family if key not in reachable for member in groups[key])
+        direct_addresses = {result_address(assets[groups[key][0]]) for key in visible}
+        redirected_hosts = {}
+        for member in combined:
+            asset = assets[member]
+            original = urlsplit(asset["url"])
+            final = urlsplit(asset.get("final_url") or asset["url"])
+            if original.hostname and final.hostname and original.hostname != final.hostname:
+                address = urlunsplit((original.scheme, original.netloc, "/", "", ""))
+                if address not in direct_addresses:
+                    redirected_hosts.setdefault(address, member)
+        pair_id = (("site_variants", tuple(sorted(visible)), tuple(sorted(redirected_hosts)))
+                   if len(visible) + len(redirected_hosts) > 1 else None)
+        row_key = ("site", tuple(sorted(family)))
+        rows.append((row_key, combined, pair_id, False, combined))
+        count += 1
+        if pair_id in expanded_pairs:
+            for child_key in visible[1:]:
+                rows.append((child_key, groups[child_key], None, True, groups[child_key]))
+            for address, member in sorted(redirected_hosts.items()):
+                rows.append((("redirect_alias", address, member), [member], None, True, [member]))
+    return rows, count
 
 
 def active_display(active, asset=None):
@@ -347,6 +508,9 @@ class MainWindow(QMainWindow):
         self.other_result_count = 0
         self.row_opacity = {}
         self.row_fades = {}
+        self.copy_toast_timer = QTimer(self)
+        self.copy_toast_timer.setSingleShot(True)
+        self.copy_toast_timer.timeout.connect(self.hide_copy_toast)
         self.help_buttons = {}
         self.words = files("hunter").joinpath("data/subdomains.txt").read_text(encoding="utf-8").split()
         self.storage_failed = False
@@ -400,11 +564,6 @@ class MainWindow(QMainWindow):
         history.setToolTip("Open previous scans saved on this computer.")
         history.clicked.connect(self.open_history)
         top.addWidget(history)
-        self.export_btn = QPushButton("Export")
-        self.export_btn.setToolTip("Save the complete scan report, including checked sites without PHP evidence.")
-        self.export_btn.clicked.connect(self.export)
-        self.export_btn.setEnabled(False)
-        top.addWidget(self.export_btn)
         root.addLayout(top)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -551,15 +710,19 @@ class MainWindow(QMainWindow):
         result_layout = QVBoxLayout(results)
         result_layout.setContentsMargins(0, 0, 0, 0)
         toolbar = QHBoxLayout()
+        toolbar.setContentsMargins(0, 5, 0, 0)
         self.start_btn = QPushButton("Scan")
         self.start_btn.setObjectName("primary")
         self.start_btn.clicked.connect(self.start_scan)
         toolbar.addWidget(self.start_btn)
         self.pause_btn = QPushButton("Pause")
+        self.pause_btn.setObjectName("pauseButton")
+        self.pause_btn.setCheckable(True)
         self.pause_btn.setEnabled(False)
         self.pause_btn.clicked.connect(self.pause_scan)
         toolbar.addWidget(self.pause_btn)
         self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setObjectName("stopButton")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_scan)
         toolbar.addWidget(self.stop_btn)
@@ -568,7 +731,7 @@ class MainWindow(QMainWindow):
         self.summary.setObjectName("metric")
         self.summary.setToolTip("PHP sites / all reached websites. DNS candidates and unreachable addresses are not counted.")
         toolbar.addWidget(self.summary)
-        self.show_other = QCheckBox("Show other sites")
+        self.show_other = StyledCheckBox("Show other sites")
         self.show_other.setEnabled(False)
         self.show_other.setToolTip("After a completed scan, show reached websites where PHP was not detected below the PHP results. An absent PHP indicator does not rule out PHP.")
         self.show_other.toggled.connect(lambda _: self.refresh_results(animate=False))
@@ -611,14 +774,22 @@ class MainWindow(QMainWindow):
             alignment = Qt.AlignmentFlag.AlignVCenter | (Qt.AlignmentFlag.AlignLeft if column == 0 else Qt.AlignmentFlag.AlignHCenter)
             self.table.horizontalHeaderItem(column).setTextAlignment(alignment)
         self.table.setItemDelegate(ResultFadeDelegate(self))
+        self.table.cellClicked.connect(self.copy_result_address)
         self.table.cellClicked.connect(self.toggle_result_group)
         self.table.cellDoubleClicked.connect(self.show_details)
+        self.copy_toast = CopyToast(self.table.viewport())
+        self.copy_toast.hide()
         result_layout.addWidget(self.table, 1)
         status_row = QHBoxLayout()
         self.current_status = QLabel("Ready to scan")
         self.current_status.setObjectName("currentStatus")
         self.current_status.setToolTip("Shows only the current task. Open the journal for full activity details.")
         status_row.addWidget(self.current_status, 1)
+        self.export_btn = QPushButton("Export results")
+        self.export_btn.setToolTip("After the scan ends, save only the result rows currently shown. Search, Show other sites and expanded addresses affect the export.")
+        self.export_btn.clicked.connect(self.export)
+        self.export_btn.setEnabled(False)
+        status_row.addWidget(self.export_btn)
         self.drawer_btn = QPushButton("Journal  ›")
         self.drawer_btn.setObjectName("drawerButton")
         self.drawer_btn.setCheckable(True)
@@ -681,10 +852,11 @@ class MainWindow(QMainWindow):
     def option(self, layout, title, description, impact, warning=False):
         explanation = help_html(description, impact)
         row = QWidget()
+        row.setObjectName("optionRow")
         row_layout = QHBoxLayout(row)
-        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setContentsMargins(7, 0, 0, 0)
         row_layout.setSpacing(4)
-        box = QCheckBox(title)
+        box = StyledCheckBox(title)
         box.setToolTip(explanation)
         row_layout.addWidget(box, 1)
         row_layout.addWidget(self.help_button(explanation, title, warning))
@@ -770,6 +942,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Check the addresses", str(exc))
             return
         self.stop_result_fades()
+        self.copy_toast_timer.stop()
+        self.hide_copy_toast()
         self.assets.clear()
         self.rows.clear()
         self.row_members.clear()
@@ -790,9 +964,13 @@ class MainWindow(QMainWindow):
         self.activity.clear()
         self.summary.setText("PHP sites 0/0")
         self.run_record = {}
+        self.export_btn.setEnabled(False)
+        self.start_btn.setText("Scanning…")
         self.start_btn.setEnabled(False)
+        self.pause_btn.setChecked(False)
         self.pause_btn.setEnabled(True)
         self.pause_btn.setText("Pause")
+        self.stop_btn.setText("Stop")
         self.stop_btn.setEnabled(True)
         self.current_status.setText("Preparing scan…")
         self.thread = ScanThread(options, self)
@@ -805,25 +983,37 @@ class MainWindow(QMainWindow):
             return
         if self.thread.control.paused.is_set():
             self.thread.control.paused.clear()
+            self.pause_btn.setChecked(False)
             self.pause_btn.setText("Pause")
+            self.start_btn.setText("Scanning…")
             self.current_status.setText("Resuming scan…")
         else:
             self.thread.control.paused.set()
+            self.pause_btn.setChecked(True)
             self.pause_btn.setText("Resume")
-            self.current_status.setText("Paused")
+            self.start_btn.setText("Paused")
+            self.current_status.setText("Pausing after the current request…")
 
     def stop_scan(self):
-        if self.thread:
+        if self.thread and self.thread.isRunning():
             self.thread.control.stopped.set()
             self.thread.control.paused.clear()
+            self.start_btn.setText("Stopping…")
+            self.pause_btn.setChecked(False)
+            self.pause_btn.setText("Pause")
             self.pause_btn.setEnabled(False)
+            self.stop_btn.setText("Stopping…")
             self.stop_btn.setEnabled(False)
-            self.current_status.setText("Stopping scan…")
+            self.current_status.setText("Stopping after the current request…")
 
     def thread_done(self):
+        self.start_btn.setText("Scan")
         self.start_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
+        self.pause_btn.setChecked(False)
+        self.pause_btn.setText("Pause")
         self.stop_btn.setEnabled(False)
+        self.stop_btn.setText("Stop")
         old_thread = self.thread
         self.thread = None
         if old_thread:
@@ -838,7 +1028,7 @@ class MainWindow(QMainWindow):
             action(*args)
         except Exception as exc:
             self.storage_failed = True
-            self.activity.appendPlainText(f"Session storage failed: {exc}. Export the current report to retain results.")
+            self.activity.appendPlainText(f"Session storage failed: {exc}. Export the visible results to retain them.")
             self.current_status.setText("Could not save session · export the results")
 
     def on_event(self, event):
@@ -852,6 +1042,18 @@ class MainWindow(QMainWindow):
             asset = event["asset"]
             self.update_asset(asset)
             self.persist(self.store.save_asset, self.run_record["id"], asset)
+            if asset.get("external_redirect"):
+                self.activity.appendPlainText(
+                    f"Outside scan scope: {asset['url']} → {asset.get('final_url', '')}")
+            elif asset.get("wildcard_http_match"):
+                self.activity.appendPlainText(
+                    f"Wildcard page: {asset['url']} matches a random DNS name; excluded from sites")
+            elif empty_site_response(asset):
+                self.activity.appendPlainText(
+                    f"Empty response: {asset['url']} returned HTTP 200 without page content or PHP evidence; excluded from sites")
+            elif weak_error_response(asset):
+                self.activity.appendPlainText(
+                    f"HTTP error: {asset['url']} did not establish a live PHP site; excluded from sites")
         elif kind == "stage":
             self.activity.appendPlainText(event["stage"])
             self.progress.setRange(0, event["total"])
@@ -896,6 +1098,7 @@ class MainWindow(QMainWindow):
                 self.activity.appendPlainText("Coverage: " + json.dumps(event["coverage"], ensure_ascii=False))
             self.current_status.setText({"COMPLETED": "Done", "STOPPED": "Stopped", "FAILED": "Failed"}.get(event["status"], event["status"]))
             self.show_other.setEnabled(event["status"] == "COMPLETED")
+            self.export_btn.setEnabled(bool(self.assets))
 
     def update_asset(self, asset, refresh=True):
         url = asset.get("id", asset["url"])
@@ -905,7 +1108,24 @@ class MainWindow(QMainWindow):
             self.refresh_results()
         elif refresh:
             self.update_result_count()
-        self.export_btn.setEnabled(bool(self.assets))
+
+    def copy_result_address(self, row, column):
+        address_item = self.table.item(row, 0)
+        key = address_item.data(Qt.ItemDataRole.UserRole) if address_item else None
+        if key not in self.assets:
+            return
+        address = address_item.data(DISPLAY_ADDRESS_ROLE) or result_address(self.assets[key])
+        QApplication.clipboard().setText(address)
+        self.copy_toast.adjustSize()
+        viewport = self.table.viewport()
+        self.copy_toast.move(max(8, (viewport.width() - self.copy_toast.width()) // 2),
+                             max(8, viewport.height() - self.copy_toast.height() - 12))
+        self.copy_toast.raise_()
+        self.copy_toast.show()
+        self.copy_toast_timer.start(1000)
+
+    def hide_copy_toast(self):
+        self.copy_toast.hide()
 
     def stop_result_fades(self):
         for animation in self.row_fades.values():
@@ -972,7 +1192,7 @@ class MainWindow(QMainWindow):
                                    + ([None] if other_layout else [])
                                    + [("other", group_key) for group_key, _, _, _, _ in other_layout])
             for row, (group_key, members, pair_id, child, search_members) in enumerate(layout):
-                representative = min(members, key=lambda key: result_preference(self.assets[key]))
+                representative = members[0]
                 self.rows[representative] = row
                 self.row_members[representative] = members
                 self.row_search_members[representative] = search_members
@@ -980,8 +1200,9 @@ class MainWindow(QMainWindow):
                     self.expandable_rows[row] = pair_id
                 prefix = ("    ↳ " if child else "▾ " if pair_id and pair_id in self.expanded_pairs else
                           "▸ " if pair_id else "")
-                self.render_result_row(self.assets[representative], row, members, prefix,
-                                       expandable=bool(pair_id))
+                display_address = group_key[1] if group_key[0] == "redirect_alias" else None
+                self.render_result_row(site_summary(self.assets, members, self.assets[representative]), row, members, prefix,
+                                       expandable=bool(pair_id), display_address=display_address)
                 verdict = self.table.item(row, 5).text()
                 if (animate and self.isVisible() and group_key not in self.row_fades and
                         (not any(member in previous for member in members) or
@@ -992,14 +1213,15 @@ class MainWindow(QMainWindow):
                 self.render_other_header(self.other_header_row)
             for offset, (group_key, members, pair_id, child, search_members) in enumerate(other_layout):
                 row = other_start + offset
-                representative = min(members, key=lambda key: result_preference(self.assets[key]))
+                representative = members[0]
                 self.other_rows[representative] = row
                 self.other_search_members[representative] = search_members
                 if pair_id:
                     self.other_expandable_rows[row] = pair_id
                 prefix = ("    ↳ " if child else "▾ " if pair_id and pair_id in self.other_expanded_pairs else
                           "▸ " if pair_id else "")
-                self.render_other_row(self.assets[representative], row, members, prefix, bool(pair_id))
+                display_address = group_key[1] if group_key[0] == "redirect_alias" else None
+                self.render_other_row(self.assets[representative], row, members, prefix, bool(pair_id), display_address)
         finally:
             self.table.setUpdatesEnabled(True)
         self.table.verticalScrollBar().setValue(scroll)
@@ -1037,28 +1259,31 @@ class MainWindow(QMainWindow):
             item.setFont(font)
             self.table.setItem(row, column, item)
 
-    def render_other_row(self, asset, row, members, address_prefix="", expandable=False):
-        display_url = result_address(asset)
+    def render_other_row(self, asset, row, members, address_prefix="", expandable=False, display_address=None):
+        display_url = display_address or result_address(asset)
         tooltip = ("Radar reached this website but found no public PHP indicators. "
-                   "This does not rule out PHP.")
+                   "This does not rule out PHP. Click to copy its address.")
         if len(members) > 1:
             tooltip += "\nAlso checked: " + ", ".join(self.assets[key]["url"] for key in members)
         if expandable:
-            tooltip += "\nClick to show or hide the HTTPS address."
+            tooltip += "\nClick to show or hide other addresses of this site."
         values = [address_prefix + display_url, str(asset["http_status"]), "", "", "", ""]
         for column, value in enumerate(values):
             item = QTableWidgetItem(value)
+            if column == 0:
+                item.setData(Qt.ItemDataRole.UserRole, asset.get("id", asset["url"]))
+                item.setData(DISPLAY_ADDRESS_ROLE, display_url)
             item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter |
                                   (Qt.AlignmentFlag.AlignLeft if column == 0 else Qt.AlignmentFlag.AlignHCenter))
             item.setToolTip(tooltip if column == 0 else value)
             item.setForeground(QColor("#687785"))
             self.table.setItem(row, column, item)
 
-    def render_result_row(self, asset, row, members, address_prefix="", expandable=False):
+    def render_result_row(self, asset, row, members, address_prefix="", expandable=False, display_address=None):
         url = asset.get("id", asset["url"])
-        active_asset = preferred_active_asset(self.assets, members, asset)
+        active_asset = preferred_active_asset(self.assets, members, self.assets[url])
         active_label, active_tooltip = active_display(active_asset.get("active", {}), active_asset)
-        display_url = result_address(asset)
+        display_url = display_address or result_address(asset)
         if (active_label == "Redirects to HTTPS" and
                 urlsplit(display_url).scheme == "https"):
             checked_at = active_asset.get("active", {}).get("checked_at")
@@ -1074,16 +1299,21 @@ class MainWindow(QMainWindow):
                            "At risk": "The site reports a PHP version from before the upstream fix. Check for vendor backports.",
                            "Vulnerable": "Two small active requests found PHP session behavior from before the security fix. This identifies an unpatched code path, not code execution.",
                            "Unconfirmed": "PHP was found, but the public evidence cannot establish its patch level. Check server or hosting inventory."}.get(verdict, "No assessment available.")
+        if asset.get("site_conflict"):
+            verdict_tooltip = asset["verdict_reason"]
         for col, value in enumerate(values):
             item = QTableWidgetItem(value)
             if col == 0:
                 item.setData(Qt.ItemDataRole.UserRole, url)
+                item.setData(DISPLAY_ADDRESS_ROLE, display_url)
             item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | (Qt.AlignmentFlag.AlignLeft if col == 0 else Qt.AlignmentFlag.AlignHCenter))
             address_tip = f"Reached from {asset['url']}" if display_url != asset["url"] else display_url
+            if col == 0:
+                address_tip += "\nClick to copy address. Double-click for details."
             if col == 0 and len(members) > 1:
                 address_tip += "\nAlso checked: " + ", ".join(self.assets[key]["url"] for key in members if key != url)
             if col == 0 and expandable:
-                address_tip += "\nClick to show or hide the HTTPS address."
+                address_tip += "\nClick to show or hide other addresses of this site."
             item.setToolTip(asset.get("error") or (verdict_tooltip if col == 5 else active_tooltip if col == 4 else address_tip if col == 0 else value))
             if col == 5:
                 foreground, background = {
@@ -1119,8 +1349,8 @@ class MainWindow(QMainWindow):
         if row not in self.rows.values():
             return
         url = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
-        asset = self.assets[url]
-        active_asset = preferred_active_asset(self.assets, self.row_members.get(url, [url]), asset)
+        asset = site_summary(self.assets, self.row_members.get(url, [url]), self.assets[url])
+        active_asset = preferred_active_asset(self.assets, self.row_members.get(url, [url]), self.assets[url])
         dialog = QDialog(self)
         dialog.setWindowTitle("Site details")
         dialog.resize(760, 550)
@@ -1165,7 +1395,7 @@ class MainWindow(QMainWindow):
             f"<h3>What we found</h3><ul>{''.join(clues)}</ul>"
             f"<h3>Active check</h3><p>{active_text}</p>"
             + (f"<p><b>Active evidence from:</b> {escape(active_asset.get('final_url') or active_asset['url'])}</p>"
-               if active_asset is not asset else "")
+               if active_asset is not self.assets[url] else "")
             + (f"<ul>{active_methods}</ul>" if active_methods else "") +
             "<p><small>Public indicators cannot verify the installed package or every PHP process.</small></p>")
         layout.addWidget(summary, 1)
@@ -1187,15 +1417,35 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def export(self):
-        path, selected = QFileDialog.getSaveFileName(self, "Export report", "php2shell-report.json", "JSON report (*.json);;CSV report (*.csv)")
+        rows = self.visible_result_rows()
+        if not rows:
+            QMessageBox.information(self, "Nothing to export", "No result rows are visible. Clear the search or show other sites, then try again.")
+            return
+        path, selected = QFileDialog.getSaveFileName(self, "Export results", "php2shell-results.json", "JSON results (*.json);;CSV results (*.csv)")
         if path:
-            if not Path(path).suffix:
-                path += ".csv" if selected.startswith("CSV") else ".json"
+            suffix = ".csv" if selected.startswith("CSV") else ".json"
+            if Path(path).suffix.lower() != suffix:
+                path = str(Path(path).with_suffix(suffix))
             try:
-                export_report(path, self.run_record, list(self.assets.values()))
-                self.current_status.setText("Report saved")
+                export_visible_results(path, rows)
+                self.current_status.setText("Results saved")
             except OSError as exc:
                 QMessageBox.warning(self, "Export failed", str(exc))
+
+    def visible_result_rows(self):
+        columns = ("Address", "HTTP", "PHP", "Version", "Active check", "Result")
+        rows = []
+        for row in range(self.table.rowCount()):
+            if self.table.isRowHidden(row):
+                continue
+            address_item = self.table.item(row, 0)
+            key = address_item.data(Qt.ItemDataRole.UserRole) if address_item else None
+            if key not in self.assets:
+                continue  # Section heading, not a website.
+            values = [address_item.data(DISPLAY_ADDRESS_ROLE) or result_address(self.assets[key])]
+            values.extend(self.table.item(row, column).text() for column in range(1, len(columns)))
+            rows.append(dict(zip(columns, values)))
+        return rows
 
     def open_history(self):
         if self.thread and self.thread.isRunning():
@@ -1227,6 +1477,8 @@ class MainWindow(QMainWindow):
     def restore_session(self, run):
         self.run_record = run
         self.stop_result_fades()
+        self.copy_toast_timer.stop()
+        self.hide_copy_toast()
         self.show_other.setChecked(False)
         self.show_other.setEnabled(False)
         self.assets.clear()
@@ -1245,11 +1497,15 @@ class MainWindow(QMainWindow):
         self.other_result_count = 0
         self.table.setRowCount(0)
         for asset in self.store.assets(run["id"]):
-            old_label = asset.get("verdict", "Unconfirmed")
-            if old_label == "Vulnerable" and (asset.get("active") or {}).get("status") != "UNPATCHED_SESSION_PATH":
-                old_label = "At risk"  # Previous releases used this label for version-only findings.
-            asset["verdict"] = {"Fixed": "Fixed version",
-                                "Needs verification": "Unconfirmed"}.get(old_label, old_label)
+            if asset.get("php") and asset.get("assessment") in (
+                    "POTENTIALLY_AFFECTED", "FIXED_VERSION_REPORTED", "UNKNOWN", "BUILD_VERIFICATION_REQUIRED"):
+                asset["verdict"], asset["verdict_reason"] = triage_assessment(asset)
+            else:
+                old_label = asset.get("verdict", "Unconfirmed")
+                if old_label == "Vulnerable" and (asset.get("active") or {}).get("status") != "UNPATCHED_SESSION_PATH":
+                    old_label = "At risk"  # Previous releases used this label for version-only findings.
+                asset["verdict"] = {"Fixed": "Fixed version",
+                                    "Needs verification": "Unconfirmed"}.get(old_label, old_label)
             self.update_asset(asset, refresh=False)
         self.refresh_results(animate=False)
         settings = run.get("options", {})
@@ -1267,7 +1523,7 @@ class MainWindow(QMainWindow):
         self.active_dns.setText(f"Check {len(self.words)} subdomains")
         self.ports.setText(", ".join(map(str, settings.get("ports") or WEB_PORTS[2:])))
         self.current_status.setText("Previous session loaded")
-        self.export_btn.setEnabled(bool(self.assets))
+        self.export_btn.setEnabled(bool(self.assets) and run.get("status") in ("COMPLETED", "STOPPED", "FAILED"))
         self.show_other.setEnabled(run.get("status") == "COMPLETED")
 
     def closeEvent(self, event):

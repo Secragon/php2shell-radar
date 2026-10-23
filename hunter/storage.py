@@ -34,23 +34,23 @@ class Store:
         self.db.close()
 
 
-def export_report(path, run, assets):
-    # No raw response bodies or cookie values are persisted.
+RESULT_COLUMNS = ("Address", "HTTP", "PHP", "Version", "Active check", "Result")
+
+
+def export_visible_results(path, rows):
+    """Save the presentation rows, without stored scan telemetry or journal data."""
     if str(path).lower().endswith(".csv"):
-        columns = ["url", "site_url", "final_url", "connect_ip", "host", "ips", "source", "dns", "wildcard_ambiguous", "http_status", "php", "confidence", "version", "reported_versions", "technologies", "verdict", "verdict_reason", "assessment", "active", "patch_evidence", "tls", "error", "evidence", "response_observations", "detection_partial"]
         with open(path, "w", encoding="utf-8-sig", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=columns)
+            writer = csv.DictWriter(handle, fieldnames=RESULT_COLUMNS)
             writer.writeheader()
-            for asset in assets:
+            for result in rows:
                 row = {}
-                for column in columns:
-                    value = asset.get(column, "")
-                    if isinstance(value, (dict, list)):
-                        value = json.dumps(value, ensure_ascii=False)
+                for column in RESULT_COLUMNS:
+                    value = result.get(column, "")
                     # Neutralize spreadsheet formula injection in untrusted headers/URLs.
                     if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")):
                         value = "'" + value
                     row[column] = value
                 writer.writerow(row)
     else:
-        Path(path).write_text(json.dumps({"schema": "php2shell-hunter/1", "run": run, "assets": assets}, indent=2, ensure_ascii=False), encoding="utf-8")
+        Path(path).write_text(json.dumps({"results": rows}, indent=2, ensure_ascii=False), encoding="utf-8")

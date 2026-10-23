@@ -18,15 +18,15 @@ PHP2Shell Radar is a desktop asset-discovery and PHP exposure scanner for **CVE-
 | Windows 10/11, x64 | [`PHP2Shell-Radar-windows-x64.exe`](https://github.com/Secragon/php2shell-radar/releases/latest) | Double-click the single EXE. No installer, Python or console window. |
 | Linux, x64 | [`PHP2Shell-Radar-linux-x86_64.tar.gz`](https://github.com/Secragon/php2shell-radar/releases/latest) | Extract, then run `./PHP2Shell-Radar` in a desktop session. No Python installation. |
 
-Download from the [latest release](https://github.com/Secragon/php2shell-radar/releases/latest). Each release includes `SHA256SUMS` for checking the downloads. Linux needs standard system graphics libraries; the archive is built and checked on Ubuntu 22.04 and may need a newer system library on older distributions. The app stores sessions locally under the current user's application-data directory. You can export JSON or CSV reports to a location you choose.
+Download from the [latest release](https://github.com/Secragon/php2shell-radar/releases/latest). Each release includes `SHA256SUMS` for checking the downloads. Linux needs standard system graphics libraries; the archive is built and checked on Ubuntu 22.04 and may need a newer system library on older distributions. The app stores sessions locally under the current user's application-data directory. You can export the visible result rows as JSON or CSV to a location you choose.
 
 ## What happens during a scan
 
 1. **Enter a domain or URL.** A bare domain checks web ports 80 and 443. A full URL retains its protocol, port, path and query.
 2. **Find websites.** Enabled public-source, DNS and certificate discovery gather candidate subdomains. Radar checks DNS and then HTTP before counting a candidate as a reached website.
 3. **Recognize PHP.** Headers, cookies, HTML paths, generator metadata, CMS hints and other response evidence can identify PHP without a public `phpinfo` page. The results table shows PHP findings first and updates the `PHP sites / reached websites` count as the scan runs.
-4. **Assess exposure.** A visible PHP version can indicate an upstream fixed or older build. With **Active PHP check** explicitly enabled, a small session check can also reveal PHP hidden from passive inspection. Repeated pre-fix behavior can confirm an unpatched code path. Only sites already identified as PHP may receive bounded memory-pressure requests if that small check is inconclusive. Open a result to see the evidence and limits behind its label.
-5. **Review the rest.** After the scan finishes, **Show other sites** reveals reached websites without PHP indicators. They are not given vulnerability labels. The Journal button expands the detailed activity log.
+4. **Assess exposure.** A visible PHP version can indicate an upstream fixed or older build. With **Active PHP check** explicitly enabled, a small session check can also reveal PHP hidden from passive inspection. Repeated pre-fix behavior can confirm an unpatched code path. Only sites already identified as PHP may receive bounded memory-pressure requests if that small check is inconclusive. Double-click a PHP result to see the evidence and limits behind its label.
+5. **Review and export.** Click a website row to copy its displayed address; a small rounded "Copied" message appears for one second. Equivalent direct HTTP/HTTPS and apex/`www` addresses expand below one site row. Redirecting hostnames appear beneath their destination in the same dropdown. After the scan ends, **Export results** below the table saves only the rows currently visible, with the same six result columns. Search and **Show other sites** control which rows are exported; **Journal** expands the separate activity log.
 
 | Result | Meaning |
 | --- | --- |
@@ -61,6 +61,6 @@ The local packaged output goes to `release/`. Tagged versions build both platfor
 
 ## Privacy and responsible use
 
-Scan only assets you own or are authorized to assess. Sessions and exports stay on your machine; the app does not upload results to Secragon. Discovery may query public third-party services, and active checks send requests to target sites. Reports can contain hostnames, URLs and infrastructure metadata. Local storage is unencrypted; avoid putting secrets in URL queries.
+Scan only assets you own or are authorized to assess. Sessions and exports stay on your machine; the app does not upload results to Secragon. Discovery may query public third-party services, and active checks send requests to target sites. Saved sessions can contain hostnames, URLs and infrastructure metadata; exports contain the displayed site addresses and assessments. Local storage is unencrypted; avoid putting secrets in URL queries.
 
 For a suspected security issue in Radar itself, see [SECURITY.md](SECURITY.md). Licensed under [Apache 2.0](LICENSE). Copyright © 2026 Secragon.

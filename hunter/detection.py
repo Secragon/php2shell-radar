@@ -5,6 +5,7 @@ import re
 from urllib.parse import urljoin, urlsplit
 
 from hunter.models import ADVISORIES, CVES, utc_now, version_assessment
+from hunter.site_identity import describe_site
 
 
 PHP_PATH = re.compile(r"\.(?:php[34578]?|phtml|phps)(?:/|$)", re.I)
@@ -210,13 +211,28 @@ def in_scope(url, hosts):
                (root.startswith("www.") and host == root[4:]) for root in hosts)
 
 
+def host_neutral_digest(response):
+    """Hash a page template after replacing the requested hostname it echoes."""
+    hostname = urlsplit(response.url).hostname
+    if not hostname or response.status <= 0 or response.truncated:
+        return None
+    pattern = re.compile(re.escape(hostname), re.I)
+    if not pattern.search(response.text):
+        return None
+    template = pattern.sub("{requested-host}", response.text)
+    return hashlib.sha256(template.encode("utf-8")).hexdigest()
+
+
 def fingerprint(response, scope_hosts=()):
+    scope_hosts = tuple(scope_hosts)
     observations = [observe(hop) for hop in response.history] + [observe(response)]
     # A redirect into an explicitly supplied domain's scope identifies the final
     # site, not the alias that redirected to it. Foreign sites stay excluded.
     original = authority(observations[0]["url"])
     final = authority(response.url)
-    target = final if final != original and in_scope(response.url, scope_hosts) else original
+    final_in_scope = in_scope(response.url, scope_hosts)
+    external_redirect = final != original and not final_in_scope
+    target = final if final != original and final_in_scope else original
     for observation in observations:
         observation["included_in_assessment"] = authority(observation["url"]) == target
     owned = [o for o in observations if authority(o["url"]) == target]
@@ -235,7 +251,10 @@ def fingerprint(response, scope_hosts=()):
     return {
         "observed_at": utc_now(), "final_url": response.url,
         "site_url": response.url if target == final and final != original else observations[0]["url"],
-        "content_sha256": hashlib.sha256(response.text.encode("utf-8")).hexdigest() if response.status == 200 and not response.truncated else None,
+        "external_redirect": external_redirect,
+        "content_sha256": hashlib.sha256(response.text.encode("utf-8")).hexdigest() if response.status > 0 and not response.truncated else None,
+        "host_neutral_sha256": host_neutral_digest(response),
+        "site_identity": describe_site(response),
         "http_status": response.status,
         "elapsed_ms": response.elapsed_ms, "php": "DETECTED" if strong else "LIKELY" if evidence else "NOT_ESTABLISHED",
         "confidence": "high" if strong else "medium" if medium else "low" if evidence else "none",

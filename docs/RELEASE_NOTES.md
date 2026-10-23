@@ -1,14 +1,22 @@
-PHP2Shell Radar 1.0.1 extends the existing Active check to websites whose PHP
-runtime is hidden from passive fingerprinting. A small session-path request can
-now identify PHP and distinguish the observed pre-fix warning pattern from the
-post-fix pattern. The check also reads those warnings when the server responds
-with an HTTP error status. Sites without prior PHP evidence never receive the
-memory-pressure probes.
+PHP2Shell Radar 1.1.0 expands discovery and makes results easier to use.
+Direct HTTP/HTTPS and apex/`www` views are grouped only when their public
+pages support one website identity. Shared navigation alone cannot merge
+different sites, and distinct canonical paths stay separate. Redirects and
+equivalent host aliases appear under one result, while wildcard placeholder
+pages and redirects outside the entered domain scope do not inflate the count.
 
-The interface still has one Active check option. Its help text explains the
-additional coverage and when memory-pressure checks may run. An observed
-post-fix warning pattern remains Unconfirmed because it does not establish the
-patch state of every worker or both CVEs.
+Clicking a found website copies its displayed address and shows a small rounded
+"Copied" message for one second. Double-clicking a PHP result still opens its details.
+The Export results button is now below the table and becomes available after
+a scan ends. JSON and CSV exports contain only the currently visible result
+rows and six displayed columns, without the activity journal or technical
+scan records. Search, expanded addresses and Show other sites determine which
+rows are included.
+
+Empty HTTP 200 responses and generic wildcard DNS/HTTP error pages do not
+establish sites. The journal still records candidates that could not establish
+a site. Public subdomain sources can be rate-limited, so discovery coverage is
+reported as partial when a provider is unavailable.
 
 The release includes a portable Windows GUI executable and a Linux x64 archive,
 with SHA-256 checksums.

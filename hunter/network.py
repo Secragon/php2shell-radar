@@ -40,7 +40,7 @@ class Network:
         self.control = control
         self.client = httpx.AsyncClient(
             verify=options.verify_tls, timeout=options.timeout,
-            headers={"User-Agent": "PHP2Shell-Radar/0.2 (asset-inventory)"},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; PHP2Shell-Radar; +https://github.com/Secragon/php2shell-radar)"},
             follow_redirects=False, transport=transport, trust_env=False,
             limits=httpx.Limits(max_connections=options.concurrency),
         )

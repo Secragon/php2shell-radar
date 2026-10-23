@@ -11,13 +11,50 @@ import httpx
 from hunter.checker import MAX_PROBE_BYTES, collect_active_evidence, collect_patch_evidence, multipart_probe, php_session_cookie_length, session_warning_probe, session_warning_shape
 from hunter.detection import fingerprint
 from hunter.discovery import DNSResult, discover, passive_names
-from hunter.engine import Control, run_scan
+from hunter.engine import Control, run_scan, wildcard_page_match
 from hunter.models import CVES, ScanOptions, Target, endpoints, parse_targets, passive_decisive, triage_assessment, version_assessment
 from hunter.network import Network, Response, Stopped
-from hunter.storage import Store, export_report
+from hunter.storage import Store, export_visible_results
 
 
 class ModelTests(unittest.TestCase):
+    def test_matching_wildcard_error_page_is_not_a_php_site(self):
+        page = Response("https://random.example.test/", 404,
+                        {"content-type": "text/html", "server": "cloudflare"},
+                        '<a href="/login.php">Not found</a>', 1)
+        baseline = fingerprint(page, ["example.test"])
+        candidate = fingerprint(Response("https://admin.example.test/", 404,
+                                         page.headers, page.text, 1), ["example.test"])
+        self.assertEqual(candidate["php"], "LIKELY")
+        self.assertTrue(wildcard_page_match(candidate, baseline))
+        self.assertFalse(wildcard_page_match(
+            fingerprint(Response("https://real.example.test/", 404, page.headers,
+                                 "<h1>Different site</h1>", 1), ["example.test"]), baseline))
+
+    def test_dynamic_wildcard_error_template_is_still_one_page(self):
+        words = " ".join(f"word{number}" for number in range(100))
+        template = f"<title>Shared server error</title><p>{words}</p>"
+        changed = template.replace("word30", "unique30")
+        headers = {"content-type": "text/html", "server": "cloudflare"}
+        baseline = fingerprint(Response("https://random.example.test/", 404,
+                                        headers, template, 1), ["example.test"])
+        candidate = fingerprint(Response("https://candidate.example.test/", 404,
+                                         headers, changed, 1), ["example.test"])
+        self.assertTrue(wildcard_page_match(candidate, baseline))
+
+    def test_wildcard_403_echoing_each_hostname_is_not_a_separate_site(self):
+        headers = {"content-type": "text/html", "server": "Apache"}
+        def page(host, message="No site configured at this address."):
+            return fingerprint(Response(f"http://{host}/", 403, headers,
+                                        f"<title>Resource not found</title><h2>{host}</h2><p>{message}</p>", 1),
+                               ["example.test"])
+        baseline = page("radar-random.example.test")
+        candidate = page("admin.example.test")
+        self.assertNotEqual(candidate["content_sha256"], baseline["content_sha256"])
+        self.assertEqual(candidate["host_neutral_sha256"], baseline["host_neutral_sha256"])
+        self.assertTrue(wildcard_page_match(candidate, baseline))
+        self.assertFalse(wildcard_page_match(page("real.example.test", "Restricted site"), baseline))
+
     def test_legacy_warning_prefix_is_not_treated_as_validated_patch_oracle(self):
         warnings = ("Warning: Unknown: Session ID is too long or contains illegal characters\n"
                     "Warning: Unknown: Failed to read session data\n"
@@ -98,15 +135,44 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(triage_assessment(old)[0], "Unconfirmed")
         proxied = asset("8.4.26")
         proxied["proxy"] = ["Cloudflare"]
-        self.assertEqual(triage_assessment(proxied)[0], "Unconfirmed")
+        self.assertEqual(triage_assessment(proxied)[0], "At risk")
+        proxied_without_version = fingerprint(Response("https://a.test/", 200,
+            {"X-Powered-By": "PHP", "CF-Ray": "example"}, "", 1))
+        self.assertEqual(triage_assessment(proxied_without_version)[0], "Unconfirmed")
+        partial = asset("8.4.26")
+        partial["detection_partial"] = True
+        self.assertEqual(triage_assessment(partial)[0], "At risk")
+        partial["active"] = {"status": "NO_OOM_OBSERVED"}
+        self.assertEqual(triage_assessment(partial)[0], "At risk")
+        partial["active"] = {"status": "PATCHED_SESSION_PATH"}
+        self.assertEqual(triage_assessment(partial)[0], "Unconfirmed")
         self.assertFalse(passive_decisive(asset("8.4.26")))
         self.assertTrue(passive_decisive(asset("8.4.27")))
         wildcard = asset("8.4.26")
         wildcard["wildcard_ambiguous"] = True
+        self.assertEqual(triage_assessment(wildcard)[0], "Unconfirmed")
         self.assertFalse(passive_decisive(wildcard))
 
 
 class AsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rotating_wildcard_ip_still_compares_http_error_page(self):
+        host = {"target": Target("account.example.test"), "source": {"active DNS"},
+                "ips": {"127.0.0.2"}, "dns": {"A": "OK"}, "wildcard": False,
+                "wildcard_root": "example.test", "wildcard_probe": "hunter-random.example.test"}
+        events = []
+        page = '<a href="/login.php">Not found</a>'
+        transport = httpx.MockTransport(lambda request: httpx.Response(
+            404, headers={"content-type": "text/html", "server": "cloudflare"}, text=page))
+        with patch("hunter.engine.discover", new=AsyncMock(return_value=[host])):
+            await run_scan(ScanOptions([Target("example.test")], passive_dns=False,
+                                       active_dns=False, tls_names=False, interval=0),
+                           Control(), events.append, transport)
+        checked = [event["asset"] for event in events if event["type"] == "asset" and
+                   event["asset"].get("http_status") == 404]
+        self.assertEqual(len(checked), 2)
+        self.assertTrue(all(asset.get("wildcard_http_match") for asset in checked))
+        self.assertTrue(all(asset["php"] == "NOT_ESTABLISHED" for asset in checked))
+
     def options(self, **kwargs):
         return ScanOptions([Target("example.test")], interval=0, **kwargs)
 
@@ -563,7 +629,28 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             hosts = await discover(options, None, Control(), events.append)
         self.assertEqual(len(hosts), 3)
         self.assertTrue(all(h.get("wildcard") for h in hosts if h["target"].host != "example.test"))
+        self.assertTrue(all(h["scope_roots"] == {"example.test"} for h in hosts))
         self.assertTrue(any("wildcard" in e.get("message", "") for e in events))
+
+    async def test_unreachable_wildcard_tcp_port_skips_repeated_http_attempts(self):
+        options = self.options(active_dns=True, words=["www"])
+        host = {"target": Target("www.example.test"), "source": {"active DNS"},
+                "ips": {"192.0.2.1"}, "dns": DNSResult({"192.0.2.1"}, {"A": "OK"}).document(),
+                "wildcard": True, "wildcard_probe": "random.example.test",
+                "wildcard_root": "example.test"}
+        requests = []
+        def handler(request):
+            requests.append(str(request.url))
+            return httpx.Response(200, text="")
+        events = []
+        with patch("hunter.engine.discover", new=AsyncMock(return_value=[host])), \
+             patch("hunter.engine.tcp_port_reachable", new=AsyncMock(return_value=False)):
+            await run_scan(options, Control(), events.append, httpx.MockTransport(handler))
+        skipped = [event["asset"] for event in events if event["type"] == "asset" and
+                   event["asset"].get("assessment") == "WILDCARD_PORT_UNREACHABLE"]
+        self.assertEqual(len(skipped), 2)
+        self.assertEqual(events[-1]["coverage"]["wildcard_tcp_skipped"], 2)
+        self.assertTrue(all("random.example.test" in url for url in requests))
 
     async def test_two_passive_sources_dedup_and_domain_matching(self):
         def handler(request):
@@ -584,19 +671,22 @@ class StorageTests(unittest.TestCase):
             store = Store(Path(directory) / "sessions.sqlite3")
             run = {"id": "123", "status": "COMPLETED"}
             asset = {"url": "https://example.test/", "host": "example.test", "error": "=DANGEROUS()", "evidence": [{"type": "header"}]}
+            result = {"Address": asset["url"], "HTTP": "200", "PHP": "Detected", "Version": "8.4.26",
+                      "Active check": "Off", "Result": "=DANGEROUS()"}
             try:
                 store.save_run(run)
                 store.save_asset("123", asset)
                 self.assertEqual(store.assets("123"), [asset])
                 self.assertEqual(store.runs(), [run])
                 path = Path(directory) / "out.json"
-                export_report(path, run, [asset])
-                self.assertEqual(json.loads(path.read_text())["assets"], [asset])
+                export_visible_results(path, [result])
+                self.assertEqual(json.loads(path.read_text())["results"], [result])
                 path = Path(directory) / "out.csv"
-                export_report(path, run, [asset])
+                export_visible_results(path, [result])
                 with path.open(encoding="utf-8-sig", newline="") as handle:
                     row = next(csv.DictReader(handle))
-                self.assertEqual(row["error"], "'=DANGEROUS()")
+                self.assertEqual(row["Result"], "'=DANGEROUS()")
+                self.assertEqual(set(row), set(result))
             finally:
                 store.close()
 

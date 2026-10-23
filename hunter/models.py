@@ -132,19 +132,21 @@ def triage_assessment(asset: dict) -> tuple[str, str]:
             return "Unconfirmed", "The active session-path result conflicts with reported patch evidence; check the actual PHP workers."
         return "Vulnerable", ("Two active requests reproduced PHP session behavior present before the security fix "
                               "and absent from matched fixed releases. This confirms an unpatched code path, not code execution.")
-    if asset.get("php") != "DETECTED" or asset.get("detection_partial"):
-        return "Unconfirmed", "PHP runtime or complete evidence is not established."
-    if asset.get("proxy"):
-        return "Unconfirmed", "An edge proxy may obscure the PHP runtime being assessed."
+    if asset.get("php") != "DETECTED":
+        return "Unconfirmed", "PHP runtime is not established."
     if asset.get("wildcard_ambiguous"):
         return "Unconfirmed", "Wildcard DNS makes this hostname's backend identity uncertain."
     status = asset.get("assessment")
-    if status == "FIXED_VERSION_REPORTED":
-        return "Fixed version", "The endpoint reports an upstream fixed PHP version; verify the deployed build and workers."
     if status == "POTENTIALLY_AFFECTED":
         if patch.get("status") == "PATCH_FEATURE_OBSERVED" or active.get("status") == "PATCHED_SESSION_PATH":
             return "Unconfirmed", "An older reported version also shows post-fix behavior; check vendor backports."
         return "At risk", "The endpoint reports a PHP version below the upstream fix. Backports and the actual runtime still require verification."
+    if asset.get("detection_partial"):
+        return "Unconfirmed", "The partial response does not establish the PHP patch level."
+    if asset.get("proxy"):
+        return "Unconfirmed", "An edge proxy may obscure the PHP runtime being assessed."
+    if status == "FIXED_VERSION_REPORTED":
+        return "Fixed version", "The endpoint reports an upstream fixed PHP version; verify the deployed build and workers."
     return "Unconfirmed", "Available HTTP evidence does not establish the PHP patch level."
 
 

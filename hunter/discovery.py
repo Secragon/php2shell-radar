@@ -259,7 +259,8 @@ async def thc_names(domain, network, log):
 
 
 async def discover(options, network, control, emit):
-    discovered = {(t.host, t.url): {"target": t, "source": {"input"}, "ips": set()} for t in options.targets}
+    discovered = {(t.host, t.url): {"target": t, "source": {"input"}, "ips": set(),
+                                   "scope_roots": {t.host}} for t in options.targets}
     roots = sorted({t.host for t in options.targets})
     log = lambda message: emit({"type": "log", "message": message})
     for root in roots:
@@ -288,10 +289,15 @@ async def discover(options, network, control, emit):
             for name in await public_link_names(root, network, log):
                 candidates.setdefault(name, set()).add("public site link")
         wildcard = set()
+        wildcard_probe = None
         if options.active_dns:
             for _ in range(3):
                 await control.checkpoint()
-                wildcard.update(await resolve(f"hunter-{secrets.token_hex(10)}.{root}", options.timeout))
+                probe = f"hunter-{secrets.token_hex(10)}.{root}"
+                addresses = await resolve(probe, options.timeout)
+                if addresses and wildcard_probe is None:
+                    wildcard_probe = probe
+                wildcard.update(addresses)
             for word in options.words:
                 name = candidate_name(f"{word}.{root}", root)
                 if name:
@@ -314,11 +320,19 @@ async def discover(options, network, control, emit):
                     ambiguous = bool(wildcard and result.ips and result.ips <= wildcard)
                     key = (name, None)
                     if key not in discovered:
-                        discovered[key] = {"target": Target(name), "source": set(), "ips": result.ips}
+                        discovered[key] = {"target": Target(name), "source": set(), "ips": result.ips,
+                                           "scope_roots": set()}
                     host = discovered[key]
+                    host["scope_roots"].add(root)
                     host["source"].update(sources)
                     host["dns"] = result.document()
                     host["wildcard"] = ambiguous
+                    # CDN wildcard answers can rotate among several addresses.
+                    # Compare the random HTTP page for every resolved candidate;
+                    # an IP mismatch alone does not prove a separate website.
+                    if wildcard_probe and result.ips:
+                        host["wildcard_probe"] = wildcard_probe
+                        host["wildcard_root"] = root
                     if ambiguous:
                         host["source"].add("wildcard ambiguous")
                     # Retain historical, NXDOMAIN and temporarily unresolved candidates.

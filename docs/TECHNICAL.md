@@ -71,7 +71,7 @@ crawling, every-IP checks and active PHP POST checks require explicit opt-in.
 | Public subdomain discovery | crt.sh + Cert Spotter (maximum 50 pages), HackerTarget Hostsearch (public 500-line cap), Subdomain Center (anonymous 500-name cap), IP.THC.ORG (up to five pages / 500 names), and same-domain links on the entered site's homepage (first 512 KiB, maximum 1000 links). crt.sh gets one retry after a transport failure. Provider errors, truncation and caps are logged as partial. Public names are validated with current DNS and HTTP checks. No external executable or API key is required. |
 | Active DNS | 100 editable names. A/AAAA resolution, canonical CNAME names, one retry for transient errors. Distinct timeout, NXDOMAIN, NODATA, SERVFAIL and REFUSED states. |
 | Recursive DNS | One additional level: maximum 20 resolved non-wildcard parents × the first 50 names. |
-| Wildcard analysis | Three random-name samples. IP-matching names are retained as ambiguous candidates, not silently removed. This is heuristic and is not HTTP virtual-host validation. |
+| Wildcard analysis | Three random DNS names identify wildcard IPs. Radar checks TCP reachability once per wildcard IP/port, avoiding repeated HTTP attempts where the port cannot be reached. It also compares HTTP/HTTPS pages, including shared error pages, at one random name with every resolved candidate under that root. Exact templates are compared after replacing an echoed request hostname, so host-specific placeholder text does not create false sites. A candidate serving the same page and PHP/server fingerprint is kept in the journal but excluded from site results; distinct content or headers remain eligible. This handles rotating CDN addresses, where a DNS IP mismatch alone does not prove a separate website. The heuristic does not prove that every virtual host was found. |
 | TLS names | SAN names from the entered domain's HTTPS certificate, using its explicit HTTPS port if supplied; certificate metadata is read without trusting its identity. Matching subdomains are resolved. |
 | CNAME candidates | Matching canonical names from DNS results are resolved in one additional batch. |
 | Web ports | Ports 80 and 443 are always checked. Editable additional defaults: 8080, 8443, 8000, 8888, 3000, 5000, 8081, 9000. Both HTTP and HTTPS are attempted on nonstandard ports. |
@@ -80,6 +80,12 @@ crawling, every-IP checks and active PHP POST checks require explicit opt-in.
 
 Unresolved and historical candidates stay visible as `DNS_UNRESOLVED`; they are
 not described as live applications. Wildcard candidates remain marked ambiguous.
+Redirects outside the entered domain scope are logged but excluded from site results.
+An HTTP 200 response with an empty body and no PHP evidence, or a generic HTTP
+error other than 401/403 with only weak PHP hints, is kept in the journal but does
+not establish a website.
+HTTP requests use a browser-compatible,
+product-identified User-Agent so servers can return the page visitors receive.
 Source coverage messages, unresolved counts, HTTP/TLS errors and partial crawling
 are saved with the session. Neither CT nor the configured discovery methods can
 guarantee complete asset coverage. No sibling-domain or IP-range enumeration is
@@ -166,6 +172,10 @@ patch evidence. This confirms an unpatched code path, not successful exploitatio
 or code execution. OOM, connection failure and cookie anomalies alone never produce
 **Vulnerable**. INI settings and per-CVE evidence remain in technical details.
 Open a result for its evidence and limitations.
+An explicit older PHP version remains **At risk** when a proxy is present or the
+response body is truncated; neither condition negates the version header. A
+conflicting post-fix active signal remains **Unconfirmed**. Restored sessions
+recalculate these labels from their saved evidence.
 
 | HTTP/build result | Meaning |
 | --- | --- |
@@ -189,12 +199,23 @@ The light counter shows PHP sites / all reached websites and updates as HTTP che
 DNS-only candidates and unreachable addresses are excluded. After a completed scan,
 **Show other sites** adds reached websites without PHP indicators below the PHP results,
 without vulnerability labels or colors. Lack of a public PHP indicator does not rule out PHP.
-Pages on the same final host, scheme and port with matching PHP assessments
-appear as one result, even when aliases redirect to different paths. Byte-identical
-apex and `www` pages with matching assessments also merge. All checked addresses
-and reached pages remain in the details and full export. Discovered
-DNS and HTTP candidates stay in scan progress, saved session data and the full
-export; they do not appear as findings before PHP recognition. Double-click a
+Pages on the same reached origin appear as one result, even when aliases redirect
+to different paths. Redirecting HTTP aliases appear under their HTTPS destination.
+Direct HTTP/HTTPS and apex/`www` variants appear in a dropdown when their
+public page content identifies them as one website. A bounded HTML text sketch
+also covers truncated responses and minor dynamic changes. Similar layout alone
+does not merge two sites: the pages must also share a title or the full canonical
+URL, including its path. Distinctly different pages remain separate. Host aliases
+with the same complete page body and a title
+identifying their shared destination fold only within the same input domain scope.
+Redirecting hostnames are listed beneath their destination; protocol-only HTTP to
+HTTPS upgrades are omitted from that list. HTTP 401 and 403 responses remain reached
+sites; their HTTP/HTTPS views group only when the complete response bodies match.
+Generic error pages do not create another site when a healthy
+variant was reached. Checked addresses
+and reached pages remain in saved session data; grouped PHP findings also show
+their checked addresses in details. DNS candidates stay in scan progress and
+saved session data; they do not appear as findings before PHP recognition. Double-click a
 row for evidence, DNS, backend IP and per-CVE details. Hover over
 or click an option's `?` for a plain-language explanation. The More options
 window shows additional settings together without scrolling. Public subdomain,
@@ -205,8 +226,11 @@ on the right. Pause prevents new operations at checkpoints;
 in-flight work may finish. Stop preserves partial results. Closing during a scan
 requests cancellation and closes after the worker exits.
 
-SQLite sessions use Qt's per-user application-data directory. JSON exports include
-coverage and full metadata; CSV includes DNS, backend, TLS and diagnostic fields.
+SQLite sessions use Qt's per-user application-data directory and retain technical
+scan data for later inspection. JSON and CSV exports contain only the six displayed
+columns and rows currently visible in the results table. Search, expanded
+addresses and Show other sites affect the export; the journal and technical
+metadata are excluded.
 No raw response bodies or session cookie values are saved. URL queries are saved:
 avoid entering secrets in URLs. Storage is local and unencrypted. Starting from
 a saved session repeats its configuration as a new run; automatic diffs are not
