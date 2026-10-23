@@ -123,14 +123,20 @@ another fresh ID. The extra session-write warning identifies the pre-fix code
 path; its absence alongside the two expected startup warnings identifies the
 post-fix behavior. The whole active collector was compared with matched official
 Windows PHP 8.2, 8.3, 8.4 and 8.5 builds on both sides of the fix. The response
-body and session ID are not saved. This check requires visible PHP warnings and
-enabled upload progress; otherwise it is inconclusive. On recognized WordPress
+body and session ID are not saved. When passive evidence does not identify PHP,
+the active option runs only this small request: visible startup warnings can
+identify a hidden PHP site, while a silent response leaves it undiscovered.
+The warning sequence can be recognized even if the POST returns an HTTP error.
+This check requires visible PHP warnings and enabled upload progress; otherwise
+it is inconclusive. On recognized WordPress
 sites, a silent front page leads to a read-only GET and the same small check on
 `wp-login.php`, which executes PHP directly. This path recovered a repeatable
 post-fix warning pattern on an authorized production WordPress site where `/`
 showed none; it does not imply every worker is patched. If no warning pattern is
-visible on either path, the endpoint can receive up to three bounded multipart POSTs per
-host/backend. They use many part headers, nested empty file controls and PHP
+visible on either path, an endpoint already identified as PHP can receive up to
+three bounded multipart POSTs per host/backend. A site with no PHP evidence
+never receives these memory-pressure requests. They use many part headers,
+nested empty file controls and PHP
 session upload progress.
 The latter uses a new random session ID in a form field. Each body is
 capped at 2.6 MB, requests are serialized across the scan, and any OOM/5xx/

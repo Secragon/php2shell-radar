@@ -91,9 +91,13 @@ Downloads and generated test apps stay under ignored `artifacts/php-lab/`. Each
 server is terminated in a finally block. The validation script asserts the
 expected comparison and writes its full report to `artifacts/php-lab/validation.json`.
 The production opt-in active collector first sends one or two small session
-requests. If their warning pattern is unavailable, it may send three bounded multipart
-memory-pressure requests after passive and diagnostic checks remain
-inconclusive. They are globally serialized and stop on the first anomaly.
+requests. It also uses this small check on reached sites without passive PHP
+evidence; a repeated supported-branch warning pattern can reveal hidden PHP.
+An HTTP error status does not hide a complete warning pattern. This broader
+coverage has offline mocked-response tests, but was not part of the matched
+PHP build matrix above. Only sites already identified as PHP may receive three
+bounded multipart memory-pressure requests if the small check is inconclusive.
+They are globally serialized and stop on the first anomaly.
 Run `scripts/validate_bounded_oom_lab.py` for a localhost-only comparison of
 those exact bodies against 8.4.26 and 8.4.27. See
 `ACTIVE_CHECK_RESEARCH.md` for its observations and why OOM alone cannot give a

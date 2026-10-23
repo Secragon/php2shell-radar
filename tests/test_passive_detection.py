@@ -240,15 +240,18 @@ class RedirectDetectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(asset['active']['status'], 'NOT_RUN')
         self.assertEqual(len(requests), 2)
 
-    async def test_active_option_reads_diagnostics_but_skips_post_when_php_not_established(self):
+    async def test_active_option_uses_only_small_oracle_when_php_not_established(self):
         requests, events = [], []
         def handler(request):
-            requests.append(request.url.path)
+            requests.append((request.method, request.url.path, len(request.content)))
             return httpx.Response(200)
         options = ScanOptions([Target('a.test', 'https://a.test/')], interval=0, active_check=True)
         with patch('hunter.engine.resolve_details', new=AsyncMock(return_value=DNSResult({'127.0.0.1'}, {'A': 'OK'}))):
             await run_scan(options, Control(), events.append, httpx.MockTransport(handler))
-        self.assertEqual(requests, ['/', '/phpinfo.php', '/info.php'])
+        self.assertEqual([(method, path) for method, path, _ in requests],
+                         [('GET', '/'), ('GET', '/phpinfo.php'), ('GET', '/info.php'), ('POST', '/')])
+        self.assertLess(requests[-1][2], 1024)
         asset = [e['asset'] for e in events if e['type'] == 'asset'][-1]
         self.assertEqual(asset['active']['status'], 'INCONCLUSIVE')
+        self.assertEqual(asset['php'], 'NOT_ESTABLISHED')
         self.assertEqual(asset['patch_evidence']['status'], 'INCONCLUSIVE')

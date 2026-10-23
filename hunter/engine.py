@@ -136,11 +136,12 @@ async def run_scan(options, control, emit, transport=None):
                         if passive_decisive(item):
                             item["active"] = {"status": "SKIPPED_AFTER_DIAGNOSTIC", "reason": "A diagnostic page reported an upstream fixed PHP version; no multipart POST was sent.",
                                               "patch_evidence": patch, "cves": {c: "NOT_CONFIRMED" for c in CVES}}
-                        elif item["php"] in ("DETECTED", "LIKELY"):
+                        else:
+                            php_candidate = item["php"] in ("DETECTED", "LIKELY")
                             final = urlsplit(response.url)
                             probe_key = (final.scheme, final.hostname,
                                          final.port or (443 if final.scheme == "https" else 80),
-                                         item["connect_ip"])
+                                         item["connect_ip"], "full" if php_candidate else "session_only")
                             async with active_lock:
                                 if probe_key in active_probed:
                                     checked_at = active_probed[probe_key]
@@ -152,13 +153,17 @@ async def run_scan(options, control, emit, transport=None):
                                     wordpress = any(tech.get("name") == "WordPress"
                                                     for tech in item.get("technologies", []))
                                     item["active"] = await collect_active_evidence(probe_network, response.url, response,
-                                                                                    patch, wordpress_login=wordpress)
-                                    if item["active"].get("status") == "UNPATCHED_SESSION_PATH":
+                                                                                    patch, wordpress_login=wordpress,
+                                                                                    allow_oom=php_candidate)
+                                    if any(e.get("type") == "session_warning_probe" and
+                                           e.get("shape") in ("unpatched", "patched")
+                                           for e in item["active"].get("evidence", [])):
                                         item["php"] = "DETECTED"
                                         item["confidence"] = "high"
-                        else:
-                            item["active"] = {"status": "INCONCLUSIVE", "reason": "Passive evidence did not indicate PHP; multipart POST was not sent.",
-                                              "patch_evidence": patch, "cves": {c: "NOT_CONFIRMED" for c in CVES}}
+                                        item["evidence"].append({"type": "active_session_warning",
+                                                                 "source": "small multipart POST",
+                                                                 "value": "PHP session start-up warnings observed",
+                                                                 "strength": "strong", "url": response.url})
                     else:
                         item["active"] = {"status": "SKIPPED", "reason_code": "BASELINE_HTTP_ERROR",
                                           "reason": f"The page returned HTTP {response.status}; no active POST was sent."}

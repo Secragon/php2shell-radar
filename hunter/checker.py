@@ -80,7 +80,7 @@ def multipart_probe(method, token):
 SESSION_WARNING_PHRASES = (
     "Session ID is too long or contains illegal characters",
     "Failed to read session data",
-    "Failed to write session data",
+    "Failed to write session data (",
 )
 
 
@@ -100,9 +100,13 @@ def session_warning_probe(token):
 
 def session_warning_shape(response):
     """Recognize PHP's startup warnings without retaining response content."""
-    if response.truncated or not 200 <= response.status < 300:
+    # PHP may emit the same warnings with an error HTTP status. The warning
+    # sequence, not the status code, is the patch-specific signal.
+    if response.truncated:
         return None
     plain = " ".join(unescape(re.sub(r"<[^>]{0,200}>", " ", response.text)).split())
+    # The supported-branch control matrix used this prefix. Older PHP emits
+    # a different format and has no matched backport control in our lab.
     positions = [plain.find("PHP Request Startup: " + phrase) for phrase in SESSION_WARNING_PHRASES]
     if positions[0] < 0 or positions[1] < positions[0]:
         return None
@@ -203,7 +207,7 @@ async def collect_active_evidence(network, url, baseline, patch_result=None,
     patched PHP can produce the same fatal error. Stop on any rejection or
     anomalous response to avoid repeated pressure on an unhealthy service.
     """
-    result = {"status": "INCONCLUSIVE", "mode": "BOUNDED_OOM",
+    result = {"status": "INCONCLUSIVE", "mode": "BOUNDED_OOM" if allow_oom else "SESSION_PATCH_ORACLE",
               "reason": "Active HTTP responses cannot establish whether this PHP build has either CVE.",
               "cves": {c: "NOT_CONFIRMED" for c in CVES}, "evidence": [], "sources": ADVISORIES}
     baseline_cookie_length = php_session_cookie_length(baseline.headers)
@@ -255,7 +259,7 @@ async def collect_active_evidence(network, url, baseline, patch_result=None,
                 except Exception as exc:
                     result["recovery"] = {"reachable": False, "error": type(exc).__name__}
                 return result
-            if response.status >= 400:
+            if response.status >= 400 and shape is None:
                 result["reason"] = f"The site returned HTTP {response.status} to the small session-path check; no memory-pressure request followed."
                 return result
             if attempt == 0:
@@ -302,6 +306,8 @@ async def collect_active_evidence(network, url, baseline, patch_result=None,
                 result["evidence"].append({"type": "dynamic_php_path", "url": login_url,
                                            "error": type(exc).__name__})
     if not allow_oom:
+        result["reason"] = ("The small session check did not expose the PHP warning pattern; "
+                            "the runtime and patch level remain unknown.")
         return result
     for method in ("part_headers", "nested_empty_files", "session_upload_progress"):
         headers, body = multipart_probe(method, secrets.token_hex(8))

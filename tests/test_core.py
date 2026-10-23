@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from hunter.checker import MAX_PROBE_BYTES, collect_active_evidence, collect_patch_evidence, multipart_probe, php_session_cookie_length, session_warning_probe
+from hunter.checker import MAX_PROBE_BYTES, collect_active_evidence, collect_patch_evidence, multipart_probe, php_session_cookie_length, session_warning_probe, session_warning_shape
 from hunter.detection import fingerprint
 from hunter.discovery import DNSResult, discover, passive_names
 from hunter.engine import Control, run_scan
@@ -18,6 +18,13 @@ from hunter.storage import Store, export_report
 
 
 class ModelTests(unittest.TestCase):
+    def test_legacy_warning_prefix_is_not_treated_as_validated_patch_oracle(self):
+        warnings = ("Warning: Unknown: Session ID is too long or contains illegal characters\n"
+                    "Warning: Unknown: Failed to read session data\n"
+                    "Warning: Unknown: Failed to write session data (files)")
+        response = Response("https://a.test/", 500, {}, warnings, len(warnings))
+        self.assertIsNone(session_warning_shape(response))
+
     def test_target_parsing_idna_ipv6_and_explicit_paths(self):
         targets = parse_targets("EXAMPLE.com\nexample.com\nhttps://app.example.com:8443/login?a=1#x\nhttp://[::1]:8000/")
         self.assertEqual(len(targets), 3)
@@ -351,6 +358,47 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(asset["active"]["status"], "UNPATCHED_SESSION_PATH")
         self.assertEqual(len([r for r in requests if r.method == "POST"]), 2)
         self.assertTrue(all(len(r.content) < 1024 for r in requests if r.method == "POST"))
+
+    async def test_small_oracle_discovers_hidden_php_on_error_response_without_oom(self):
+        requests, events = [], []
+        warnings = ("Warning: PHP Request Startup: Session ID is too long or contains illegal characters\n"
+                    "Warning: PHP Request Startup: Failed to read session data\n"
+                    "Warning: PHP Request Startup: Failed to write session data (files)")
+        def handler(request):
+            requests.append(request)
+            if request.method == "POST":
+                return httpx.Response(500, text=warnings)
+            return httpx.Response(200, text="ordinary page")
+        target = Target("example.test", "https://example.test/")
+        with patch("hunter.engine.resolve_details", new=AsyncMock(return_value=DNSResult({"127.0.0.1"}, {"A": "OK"}))):
+            await run_scan(ScanOptions([target], active_check=True, interval=0), Control(),
+                           events.append, httpx.MockTransport(handler))
+        asset = [e["asset"] for e in events if e["type"] == "asset"][-1]
+        self.assertEqual(asset["php"], "DETECTED")
+        self.assertEqual(asset["verdict"], "Vulnerable")
+        self.assertEqual(asset["active"]["status"], "UNPATCHED_SESSION_PATH")
+        posts = [r for r in requests if r.method == "POST"]
+        self.assertEqual(len(posts), 2)
+        self.assertTrue(all(len(r.content) < 1024 for r in posts))
+        self.assertFalse(any(e["type"] == "bounded_oom_probe" for e in asset["active"]["evidence"]))
+
+    async def test_small_oracle_identifies_php_but_does_not_claim_fixed_on_two_warnings(self):
+        warnings = ("Warning: PHP Request Startup: Session ID is too long or contains illegal characters\n"
+                    "Warning: PHP Request Startup: Failed to read session data")
+        requests, events = [], []
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(500 if request.method == "POST" else 200,
+                                  text=warnings if request.method == "POST" else "ordinary page")
+        target = Target("example.test", "https://example.test/")
+        with patch("hunter.engine.resolve_details", new=AsyncMock(return_value=DNSResult({"127.0.0.1"}, {"A": "OK"}))):
+            await run_scan(ScanOptions([target], active_check=True, interval=0), Control(),
+                           events.append, httpx.MockTransport(handler))
+        asset = [e["asset"] for e in events if e["type"] == "asset"][-1]
+        self.assertEqual(asset["php"], "DETECTED")
+        self.assertEqual(asset["verdict"], "Unconfirmed")
+        self.assertEqual(asset["active"]["status"], "PATCHED_SESSION_PATH")
+        self.assertEqual(sum(r.method == "POST" for r in requests), 2)
 
     async def test_wordpress_login_path_recovers_hidden_root_oracle(self):
         requests, events = [], []

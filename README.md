@@ -25,7 +25,7 @@ Download from the [latest release](https://github.com/Secragon/php2shell-radar/r
 1. **Enter a domain or URL.** A bare domain checks web ports 80 and 443. A full URL retains its protocol, port, path and query.
 2. **Find websites.** Enabled public-source, DNS and certificate discovery gather candidate subdomains. Radar checks DNS and then HTTP before counting a candidate as a reached website.
 3. **Recognize PHP.** Headers, cookies, HTML paths, generator metadata, CMS hints and other response evidence can identify PHP without a public `phpinfo` page. The results table shows PHP findings first and updates the `PHP sites / reached websites` count as the scan runs.
-4. **Assess exposure.** A visible PHP version can indicate an upstream fixed or older build. With **Active PHP check** explicitly enabled, Radar can send bounded requests to look for a repeatable pre-fix behavior. Open a result to see the evidence and limits behind its label.
+4. **Assess exposure.** A visible PHP version can indicate an upstream fixed or older build. With **Active PHP check** explicitly enabled, a small session check can also reveal PHP hidden from passive inspection. Repeated pre-fix behavior can confirm an unpatched code path. Only sites already identified as PHP may receive bounded memory-pressure requests if that small check is inconclusive. Open a result to see the evidence and limits behind its label.
 5. **Review the rest.** After the scan finishes, **Show other sites** reveals reached websites without PHP indicators. They are not given vulnerability labels. The Journal button expands the detailed activity log.
 
 | Result | Meaning |

@@ -13,6 +13,16 @@ produce **Vulnerable**. It does not execute an exploit chain or demonstrate
 memory corruption. Hidden warnings, disabled upload progress or a blocked POST
 make the check inconclusive; an ordinary OOM remains non-specific.
 
+The [PortSwigger PHP2Shell detection write-up](https://portswigger.net/blog/php2shell-x-burp-suite-detection-in-your-hands-within-a-day-of-disclosure)
+and its [active Bambda](https://github.com/PortSwigger/bambdas/blob/main/CustomScanChecks/CVE-2026-109618CVE-2026-109619-PHP2Shell.bambda)
+use the same three-warning session-path differential: the extra write warning
+is the positive signal. This independently corroborates our small check but
+does not supply a separate vulnerability oracle. We expanded the existing
+opt-in check to previously unidentified PHP sites and to complete warning
+sequences returned with HTTP errors. Such sites receive only the small request;
+the new routing behavior has mocked-response coverage, not a new matched PHP
+build matrix. A silent or blocked response stays inconclusive.
+
 The [zarguell scanner research](https://github.com/zarguell/php2shell-scanner/blob/main/docs/RESEARCH.md)
 adds one useful, low-impact routing idea: a WordPress front page can hide PHP
 output while `/wp-login.php` executes PHP. An authorized five-origin comparison
