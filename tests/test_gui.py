@@ -190,7 +190,7 @@ class GuiTests(unittest.TestCase):
             reopened.deleteLater()
 
     def test_option_help_and_advanced_dialog_have_no_nested_scroller(self):
-        help_button = self.window.help_buttons["Active check if unclear"]
+        help_button = self.window.help_buttons["Active check"]
         self.assertIn("memory", help_button.toolTip())
         for title, button in self.window.help_buttons.items():
             self.assertIn("What it does", button.toolTip(), title)

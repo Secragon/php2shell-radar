@@ -647,7 +647,7 @@ class MainWindow(QMainWindow):
             "Read phpinfo.php and info.php if the site already exposes them. They may report the PHP version or a patch clue, but are usually absent and are not needed for standard detection.",
             "Adds up to two GET requests per checked web endpoint. It does not submit data or pressure PHP memory, but exposed diagnostic pages may contain sensitive configuration.")
         self.patch_collection.setChecked(True)
-        self.active_check = self.option(detection_layout, "Active check if unclear",
+        self.active_check = self.option(detection_layout, "Active check",
             "When the PHP patch level is unclear or an older version is reported, Radar reads optional diagnostic pages, then sends a small session check and repeats it if PHP warnings appear. This can also uncover PHP that public pages do not identify. For WordPress, Radar may check wp-login.php when the front page gives no signal. Repeated pre-fix behavior means Vulnerable. Only sites already identified as PHP may receive up to three bounded memory checks if the small check is inconclusive. No executable code is sent and existing cookies are not reused.",
             "The small checks may show PHP warnings in the response. The later memory checks can exhaust a worker's memory, interrupt a request or briefly reduce site availability; the upload-progress method may create temporary session data. Radar stops on unusual or rejected responses. Hidden errors and a memory error alone cannot prove safety or vulnerability.", warning=True)
         self.advanced_detection = QWidget()

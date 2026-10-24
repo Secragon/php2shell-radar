@@ -1,4 +1,5 @@
 PHP2Shell Radar 1.1.0 expands discovery and makes results easier to use.
+The opt-in checkbox now reads "Active check"; its behavior is unchanged.
 Direct HTTP/HTTPS and apex/`www` views are grouped only when their public
 pages support one website identity. Shared navigation alone cannot merge
 different sites, and distinct canonical paths stay separate. Redirects and
